@@ -1,41 +1,25 @@
-require 'Nokogiri'
 require 'ox'
 require 'json'
-require 'redis'
 require 'mongo'
-include Mongo
-
-# Parse the dtd to create a "part of speech" map.
-# we'll use the map in our sax parser
-doc = Nokogiri::XML(File.open("jmdict_dtd"))
-dtd = nil
-# this is ugly...not sure how to use xpath to select the first document node
-doc.children.each do |c|
-    if c.type == Nokogiri::XML::Node::DTD_NODE
-        dtd = c
-    end
-end
-
-pos = Hash[dtd.entities.map {|k, v| [k, v.content]}]
+require 'zlib'
+require 'open-uri'
+require 'trollop'
 
 class Entry
-    attr_accessor :kanji, :readings, :senses
+    attr_accessor :seq, :kanji, :readings, :senses
     def initialize
+        @seq = 0
         @kanji = Array.new
         @readings = Array.new
         @senses = Array.new
     end
 
     def add_sense sense
-#        if @senses.count > 0 and sense.pos.count == 0
-#            @senses[-1].meanings.concat sense.meanings
-#        else
-            @senses << sense
-#        end
+        @senses << sense
     end
 
     def to_json(options = {})
-        {'kanji' => @kanji, 'readings' => @readings, 'senses' => @senses}.to_json
+        {'seq' => @seq, 'kanji' => @kanji, 'readings' => @readings, 'senses' => @senses}.to_json
     end
 end
 
@@ -60,6 +44,7 @@ class JMDict < ::Ox::Sax
     end
 
     def start_element(name)
+        @read_seq = name == :ent_seq
         @read_kanji = name == :keb
         @read_reading = name == :reb
         @read_meaning = name == :gloss
@@ -69,6 +54,7 @@ class JMDict < ::Ox::Sax
     end
 
     def text(value)
+        @entry.seq = value.to_i if @read_seq
         @entry.kanji << value if @read_kanji
         @entry.readings << value if @read_reading
         @sense.pos << value[1..-2] if @read_pos
@@ -90,30 +76,51 @@ class JMDict < ::Ox::Sax
     def reset
         @entry = nil
         @sense = nil
-        @read_kanji = @read_reading = @read_meaning = @read_pos = false
+        @read_kanji = @read_reading = @read_meaning = @read_pos = @read_seq = false
     end
 end
 
-handler = JMDict.new
-Ox.sax_parse(handler, File.open('jmdict_e'))
-
-client = MongoClient.new
-db = client['wasabi-db']
-coll = db['dictionary']
-
-handler.entries.each do |e|
-    value = JSON.parse(e.to_json) # e.to_json
-
-    coll.insert(value)
-
-    # e.kanji.each do |k|
-    #     redis.set(k, value)
-    # end
-
-    # e.readings.each do |r|
-    #     redis.set(r, value)
-    # end
-
-    # coll.insert(value)
-
+# 0. Handle options and connect to Mongo
+opts = Trollop::options do
+    opt :skip_download, 'Skip download', default: false
+    opt :host, 'Mongo Host', default: 'localhost'
+    opt :port, 'Mongo port', type: :int, default: 3000
+    opt :db, 'Mongo database', type: :string
+    opt :coll, 'Mongo collection', type: :string
 end
+
+Trollop::die 'must specify database' if not opts[:db]
+Trollop::die 'must specify collection' if not opts[:coll]
+
+puts 'Connecting to Mongo...'
+client = Mongo::MongoClient.new
+db = client[opts[:db]]
+coll = db[opts[:coll]]
+
+# 1. Download the dictionary file
+if opts[:skip_download]
+    puts 'Skipping download...'
+else
+    puts 'Downloading JMDict_e.gz...'
+    File.open('JMdict_e.gz', 'wb') do |saved_file|
+        open('ftp://ftp.monash.edu.au/pub/nihongo/JMdict_e.gz', 'rb') do |read_file|
+          saved_file.write(read_file.read)
+        end
+    end
+end
+
+# 2. Parse
+puts 'Parsing JMDict_e...'
+handler = JMDict.new
+Ox.sax_parse(handler, Zlib::GzipReader.open('JMdict_e.gz'))
+
+# 3. Store in mongo
+# NOTE: we could do this in the handler, but I prefer doing it as a separate step.
+puts 'Updating Mongo...'
+handler.entries.each do |e|
+    value = JSON.parse(e.to_json)
+    coll.insert(value)
+end
+
+# 4. Done
+puts 'Done.'

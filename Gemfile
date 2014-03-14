@@ -1,7 +1,7 @@
 source "https://rubygems.org"
 
-gem 'nokogiri'
 gem 'ox'
 gem 'json'
-gem 'mongo'
+gem 'mongo', '~>1.9.2'
 gem 'bson'
+gem 'trollop'
