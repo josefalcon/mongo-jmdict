@@ -1,0 +1,4 @@
+/.bundle
+/vendor/bundle
+/tmp
+**/.DS_Store
